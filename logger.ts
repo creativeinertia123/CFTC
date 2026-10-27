@@ -1,185 +1,167 @@
-// Frontend logger. Its one job is to make browser-side errors readable by the
-// building agent, which only sees the sandbox — a plain console.error never
-// reaches it. Everything logged here is POSTed to /api/log, which the backend
-// (grafted on this project) appends to /tmp/kimi-logs/app.log, the same file
-// the server writes. One file, both halves.
+// Structured logger for the backend, mirrored to /tmp/kimi-logs/app.log.
 //
-// Same-origin by construction: the preview URL is a reverse proxy to this
-// project's own server, so "/api/log" needs no host config. When the backend is
-// absent (a pure-frontend build) the POST fails and we silently fall back to
-// console — logging must never break the app.
-type Level = "info" | "warn" | "error";
-
-const ENDPOINT = "/api/log";
-// Coalesce bursts: errors during a render storm would otherwise fire one POST
-// each. Flush on a microtask so ordering is preserved.
-let queue: Array<{ level: Level; msg: string; ctx?: Record<string, unknown> }> =
-  [];
-let scheduled = false;
-
-// Bounded queue. An error storm can out-run the flush (a render loop throwing on
-// every frame emits far faster than a microtask), and an unbounded array is an
-// OOM in the very process the agent is trying to diagnose. Beyond the cap the
-// OLDEST entries are dropped: the newest are the ones that reflect the state the
-// agent will inspect, and keeping the first-N of an ever-growing burst would
-// preserve only the least informative prefix.
-const QUEUE_MAX = 500;
-let dropped = 0;
-
-// Chunks are capped at the server's per-request line limit (clientlog.ts
-// LOG_MAX_LINES_PER_REQUEST) so no chunk can be rejected wholesale.
-const SEND_MAX_LINES = 50;
-
-// Correlation with the server's request id.
+// Why a file at all: the sandbox-local log is what the building agent reads to
+// debug a preview that will not start or a request that 500s. stdout is
+// collected by the platform's log pipeline, but the agent inspects the sandbox
+// directly (its shell and this process share one sandbox), so the two sinks
+// are written from one call — same bytes in both.
 //
-// The server stamps every response with X-Request-Id (see
-// api/lib/requestcontext.ts). Browser errors are emitted *after* the failing
-// call — usually from a catch that runs once the response has already arrived —
-// so the id available at emit time is the id of the request that just failed.
+// Zero dependencies on purpose: this file is grafted into every user project,
+// so pulling in pino/winston would add weight to the template's dependency
+// surface for a feature whose whole job is "append one JSON line".
+import fs from "fs";
+import path from "path";
+import { currentRequestId } from "./requestcontext";
+import { scrubCtx, scrubValue } from "./scrub";
+
+// Fixed path (not PID-suffixed): the agent must be able to name it without
+// discovering a pid. /tmp is sandbox-local: it dies with the box, which is
+// intended (this is preview-time debugging, not post-mortem forensics) and it
+// never lands in the user's workspace (that tree is git-archived and shipped at
+// publish time).
 //
-// The trap is concurrency: with several requests in flight, "the last response
-// to arrive" is not necessarily the one that failed, and stamping it would
-// attach a confidently wrong id to the line. So ids are kept in a short window
-// and only used when exactly one candidate exists; an ambiguous emit is left
-// unstamped rather than mislabelled.
-const CORRELATION_WINDOW_MS = 2000;
-let recentIds: Array<{ id: string; at: number }> = [];
+// It is NOT "naturally bounded" — that was wishful. The rate limits in
+// clientlog.ts cap the *browser* path per minute, but server lines, access-log
+// lines and (in production) static-asset requests are not rate limited at all,
+// so a busy preview can write gigabytes over a long session and fill the disk,
+// turning a logging feature into a new outage class. Hence an explicit byte
+// budget below: past it the file is truncated once, with a marker, so the newest
+// evidence survives and the total stays bounded.
+const LOG_DIR = process.env.KIMI_LOG_DIR ?? "/tmp/kimi-logs";
+const LOG_FILE = process.env.KIMI_LOG_FILE ?? path.join(LOG_DIR, "app.log");
+// 8 MiB is far more than a debugging session reads and small enough that even a
+// hostile write rate cannot exhaust a sandbox disk.
+const LOG_MAX_BYTES = 8 * 1024 * 1024;
 
-function rememberRequestId(id: string): void {
-  const now = Date.now();
-  recentIds.push({ id, at: now });
-  recentIds = recentIds.filter(e => now - e.at <= CORRELATION_WINDOW_MS);
-}
+let bytesWritten = 0;
+let sizeKnown = false;
 
-// unambiguousRequestId returns the single recent id, or undefined when zero or
-// several are in play (an ambiguous correlation is worse than none).
-function unambiguousRequestId(): string | undefined {
-  const now = Date.now();
-  recentIds = recentIds.filter(e => now - e.at <= CORRELATION_WINDOW_MS);
-  const distinct = new Set(recentIds.map(e => e.id));
-  return distinct.size === 1 ? recentIds[recentIds.length - 1].id : undefined;
-}
-
-// Record each response's request id. Done by wrapping fetch once, at module
-// load, rather than at each call site: the injected frontend uses plain fetch /
-// tRPC / react-query, and none of them would thread a header read through by
-// hand.
-if (typeof window !== "undefined" && typeof window.fetch === "function") {
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = async (...args: Parameters<typeof fetch>) => {
-    const response = await originalFetch(...args);
+// enforceBudget truncates the file once it exceeds LOG_MAX_BYTES. Doing it here
+// (on the write path) rather than with a timer keeps the bound independent of
+// whether anything else in the process is still alive — the failure mode being
+// guarded is a runaway writer, which by definition keeps calling in.
+function enforceBudget(lineLength: number): void {
+  if (!sizeKnown) {
     try {
-      const id = response.headers.get("x-request-id");
-      if (id) rememberRequestId(id);
+      bytesWritten = fs.statSync(LOG_FILE).size;
     } catch {
-      // An opaque/error response with unreadable headers is not a reason to
-      // lose the response itself.
+      bytesWritten = 0;
     }
-    return response;
-  };
-}
-
-function flush(): void {
-  scheduled = false;
-  const batch = queue;
-  queue = [];
-  if (batch.length === 0 && dropped === 0) return;
-  // Surface the drop count as its own line: a truncated storm must not read
-  // like a complete one.
-  if (dropped > 0) {
-    batch.push({
-      level: "warn",
-      msg: "client log queue overflowed; oldest entries dropped",
-      ctx: { dropped },
-    });
-    dropped = 0;
+    sizeKnown = true;
   }
-  const requestId = unambiguousRequestId();
-  const stamped = requestId
-    ? batch.map(item => ({
-        ...item,
-        ctx: { requestId, ...item.ctx },
-      }))
-    : batch;
-  // Chunk the send. The server accepts at most LOG_MAX_LINES_PER_REQUEST (50)
-  // per POST and rejects an over-64KB body with 413, dropping the whole batch.
-  // Sending the queue as one body therefore lost the entire burst exactly when
-  // it mattered most — an error storm is the case this feature exists for, and
-  // the lines at the tail are usually the ones that explain it. Splitting keeps
-  // every line eligible; a rejected chunk cannot take the others down with it.
-  for (let i = 0; i < stamped.length; i += SEND_MAX_LINES) {
-    send(stamped.slice(i, i + SEND_MAX_LINES));
-  }
-}
-
-function send(chunk: Array<{ level: Level; msg: string; ctx?: Record<string, unknown> }>): void {
+  if (bytesWritten + lineLength <= LOG_MAX_BYTES) return;
   try {
-    // sendBeacon survives page unload (the common case for a crash); fall back
-    // to fetch where it is unavailable.
-    const body = JSON.stringify(chunk);
-    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      navigator.sendBeacon(
-        ENDPOINT,
-        new Blob([body], { type: "application/json" })
-      );
-      return;
-    }
-    void fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    }).catch(() => {});
+    fs.writeFileSync(
+      LOG_FILE,
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "warn",
+        msg: "app.log exceeded its size budget; truncated",
+        maxBytes: LOG_MAX_BYTES,
+      }) + "\n"
+    );
   } catch {
-    // Never surface a logging failure to the app.
+    // If we cannot truncate, keep appending: losing old lines is better than
+    // losing the process's ability to log at all.
+    return;
+  }
+  bytesWritten = 0;
+}
+
+let dirReady = false;
+function ensureDir(): void {
+  if (dirReady) return;
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    dirReady = true;
+  } catch {
+    // A read-only or missing /tmp must not crash the app; stdout still works.
   }
 }
 
-function emit(level: Level, msg: string, ctx?: Record<string, unknown>): void {
-  if (level === "error") console.error(msg, ctx ?? "");
-  else if (level === "warn") console.warn(msg, ctx ?? "");
-  else console.log(msg, ctx ?? "");
+type Level = "debug" | "info" | "warn" | "error";
 
-  if (queue.length >= QUEUE_MAX) {
-    // Drop the oldest and count it, so the loss is visible in the log itself
-    // rather than being silent (a storm that silently truncates reads exactly
-    // like a storm that never happened).
-    queue.shift();
-    dropped += 1;
+// Reserved fields the caller must not be able to override from ctx — same gate
+// clientlog.ts applies to browser-supplied context. Without it, a ctx carrying
+// `level`/`msg`/`ts` would rewrite the line's own identity (and could relabel a
+// `warn` as `error`, or forge a timestamp).
+const RESERVED_KEYS = new Set(["ts", "level", "msg", "requestId"]);
+
+function write(level: Level, msg: string, ctx?: Record<string, unknown>): void {
+  // Serialization is inside the try: a cyclic or BigInt-bearing ctx throws, and
+  // logging must never take a request down with it (the file sink below is
+  // explicitly best-effort for the same reason).
+  let line: string;
+  try {
+    // The request id is added here rather than at each call site: app code keeps
+    // calling log.error(msg, ctx) and the correlation comes for free. It is
+    // spread FIRST so an explicit ctx.requestId still wins.
+    const requestId = currentRequestId();
+    const extra = Object.fromEntries(
+      Object.entries(scrubCtx(ctx) ?? {}).filter(([k]) => !RESERVED_KEYS.has(k))
+    );
+    line = JSON.stringify({
+      ts: new Date().toISOString(),
+      level,
+      ...(requestId ? { requestId } : {}),
+      // The message is scrubbed too: secrets frequently arrive inside it (a URL
+      // with a query token), not only in ctx.
+      msg: scrubValue(msg),
+      ...extra,
+    });
+  } catch {
+    return;
   }
-  queue.push({ level, msg, ctx });
-  if (!scheduled) {
-    scheduled = true;
-    // queueMicrotask keeps ordering while still batching a synchronous burst.
-    queueMicrotask(flush);
+  // stdout first: if the file append throws, the message is not lost.
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  // debug and info both go to stdout via console.log: the sandbox file sink is
+  // what distinguishes them (the `level` field), and console.debug is a no-op
+  // under some defaults, which would drop the line from stdout too.
+  else console.log(line);
+
+  ensureDir();
+  try {
+    enforceBudget(line.length + 1);
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    bytesWritten += line.length + 1;
+  } catch {
+    // Best-effort sink; never let logging break a request.
+  }
+}
+
+// appendLine is the sink the client-log endpoint writes through, so browser
+// logs land in exactly the same file with the same shape as server logs.
+//
+// It also echoes to stdout, for the same reason write() does: the platform log
+// pipeline collects stdout, so a file-only browser line vanished the moment the
+// sandbox was recycled. Server lines already had both sinks; browser lines
+// having only the file was an inconsistency, not a design choice.
+export function appendLine(line: string): void {
+  try {
+    console.log(line);
+  } catch {
+    // stdout is best-effort too.
+  }
+  ensureDir();
+  try {
+    enforceBudget(line.length + 1);
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    bytesWritten += line.length + 1;
+  } catch {
+    // Best-effort.
   }
 }
 
 export const log = {
-  info: (msg: string, ctx?: Record<string, unknown>) => emit("info", msg, ctx),
-  warn: (msg: string, ctx?: Record<string, unknown>) => emit("warn", msg, ctx),
+  info: (msg: string, ctx?: Record<string, unknown>) => write("info", msg, ctx),
+  warn: (msg: string, ctx?: Record<string, unknown>) => write("warn", msg, ctx),
   error: (msg: string, ctx?: Record<string, unknown>) =>
-    emit("error", msg, ctx),
+    write("error", msg, ctx),
+  // debug exists so app code has a file-backed level below info. Without it the
+  // natural fallback is console.debug, which the sandbox file sink never sees —
+  // so "verbose logging in the app" would silently be invisible to the agent.
+  debug: (msg: string, ctx?: Record<string, unknown>) => write("debug", msg, ctx),
 };
 
-// Capture the crashes a try/catch cannot: unhandled errors and rejections are
-// exactly what the agent needs to see when a preview comes up blank.
-if (typeof window !== "undefined") {
-  window.addEventListener("error", e => {
-    emit("error", e.message || "window.onerror", {
-      filename: e.filename,
-      lineno: e.lineno,
-      colno: e.colno,
-      stack: e.error?.stack,
-    });
-  });
-  window.addEventListener("unhandledrejection", e => {
-    const reason = e.reason;
-    emit("error", "unhandledrejection", {
-      reason: reason instanceof Error ? reason.message : String(reason),
-      stack: reason instanceof Error ? reason.stack : undefined,
-    });
-  });
-}
-
-export default log;
+export const logFilePath = LOG_FILE;
