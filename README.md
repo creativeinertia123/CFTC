@@ -1,6 +1,6 @@
 # CFTC
 
-CFTC is a dark, analyst-first dashboard for CFTC Commitments of Traders positioning. It is a migration of the COT signal-room source package onto the Kimi full-stack runtime: React + tRPC + Hono + MySQL, preserving the source route map (`/`, `/matrix`, `/updates`, `/note`, `/market/:code`), its data contract, and its update-log semantics.
+CFTC is a dashboard for CFTC Commitments of Traders positioning. 
 
 ## Product scope
 
@@ -39,11 +39,3 @@ npm run check && npm run build && npm start
 ```
 
 On an empty database the first overview query triggers a background initial ingestion (~1 minute for three years of archives); the UI shows a loading state and populates automatically.
-
-## Documented deviations from the source package
-
-- The source's cryptocurrency exclusion and micro-to-parent aggregation were **not** applied: the panel keeps every market exactly as published (512 distinct markets across 2024–2026; the per-report universe is what the CFTC published that week). One market — the BBG COMMODITY index future — has no natural home in the six product classes and is labelled `Other` rather than forced into the wrong bucket.
-- The original note generator targeted DeepSeek directly; the migration routes through the platform's model gateway so the key stays server-side.
-- The Socrata-based worker described in the source README is replaced by the annual-archive path above (the Socrata host rejects datacentre clients); the outcomes, hashing semantics, and table contracts are unchanged.
-
-All user-facing copy follows British English conventions.
