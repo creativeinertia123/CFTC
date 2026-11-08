@@ -1,6 +1,6 @@
 # CFTC
 
-CFTC is a dashboard for CFTC Commitments of Traders positioning. 
+CFTC is a dark, analyst-first dashboard for CFTC Commitments of Traders positioning. It is a migration of the COT signal-room source package onto the Kimi full-stack runtime: React + tRPC + Hono + MySQL, preserving the source route map (`/`, `/matrix`, `/updates`, `/note`, `/market/:code`), its data contract, and its update-log semantics.
 
 ## Product scope
 
@@ -27,7 +27,7 @@ Canonical panel schema (one row per report date × market × trader category) li
 
 - **SSE wire-in**: `GET /api/cot/events` streams ingestion events; the layout subscribes and invalidates the views when a run completes, so the dashboard refreshes itself. If the stream drops, the client degrades to a 60-second poll.
 - **Cron**: `POST /api/scheduled/cftc-ingestion` is the production callback (secret via the `x-cot-ingestion-secret` header when `CFTC_INGESTION_SECRET` is set). Point a project Heartbeat at it with `0 0 * * 6` (00:00 UTC Saturday, safely after the Friday 15:30 ET publication). The Update log's **Run check now** action calls the same worker through tRPC.
-- After a **new report** or **revision**, a fresh note is generated server-side through the platform model gateway and stored as a new version. No automatic note is generated for no-update outcomes.
+- After a **new report** or **revision**, a fresh note is encoded server-side — a deterministic pure-JS renderer over the persisted panel (`api/cot/note.ts`), no model call, no randomness: the same panel always produces the same text. No automatic note is generated for no-update outcomes.
 
 ## Local development
 
@@ -39,3 +39,11 @@ npm run check && npm run build && npm start
 ```
 
 On an empty database the first overview query triggers a background initial ingestion (~1 minute for three years of archives); the UI shows a loading state and populates automatically.
+
+## Documented deviations from the source package
+
+- The source's cryptocurrency exclusion and micro-to-parent aggregation were **not** applied: the panel keeps every market exactly as published (512 distinct markets across 2024–2026; the per-report universe is what the CFTC published that week). One market — the BBG COMMODITY index future — has no natural home in the six product classes and is labelled `Other` rather than forced into the wrong bucket.
+- The original note generator targeted DeepSeek directly; the migration replaces it with a deterministic JS encoder, so note text is reproducible and no API key or external service is involved.
+- The Socrata-based worker described in the source README is replaced by the annual-archive path above (the Socrata host rejects datacentre clients); the outcomes, hashing semantics, and table contracts are unchanged.
+
+All user-facing copy follows British English conventions.
