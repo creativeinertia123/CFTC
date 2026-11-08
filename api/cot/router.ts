@@ -107,7 +107,7 @@ export const cotRouter = createRouter({
       for (const [k, arr] of nets) arr.push(byMarket.get(k) ?? 0);
     }
 
-    const byMarket = new Map<string, (typeof latestRows)[number]>[]>();
+    const byMarket = new Map<string, (typeof latestRows)[number][]>();
     for (const r of latestRows) {
       if (!byMarket.has(r.marketKey)) byMarket.set(r.marketKey, []);
       byMarket.get(r.marketKey)!.push(r);
